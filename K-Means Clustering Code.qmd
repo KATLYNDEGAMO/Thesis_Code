@@ -1,0 +1,300 @@
+---
+title: "K-Means Clustering Full Code"
+author: "Cagula, Degamo, Olasiman, Sarucam"
+format: html
+editor: visual
+---
+
+```{r message=FALSE, warning=FALSE}
+# Step 1: Setup Environment
+#------------------------
+# Load necessary packages
+library(factoextra)
+library(cluster)
+library(readxl)
+library(dplyr)
+library(caret)
+library(plotly)
+library(rgl)
+library(scales)
+library(gridExtra)
+library(ggrepel)  # Added for labeling points
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Step 2: Data Preparation
+#-----------------------
+# Load the dataset from the Excel file
+data <- readxl::read_xlsx(path = "/cloud/project/Patient_Dataset.xlsx", sheet = 1)
+
+# Remove rows with missing values
+# data <- na.omit(data)
+
+# Store original row numbers for observation labels
+row_ids <- rownames(data)
+
+# Select numeric columns and cap outliers 
+data_numeric <- data %>%
+  select(where(is.numeric)) %>%
+  mutate(across(everything(), cap_outliers))
+
+# Check for and remove zero variance predictors
+var_values <- apply(data_numeric, 2, var)
+zero_var_cols <- var_values == 0
+if(any(zero_var_cols)) {
+  cat("Removing", sum(zero_var_cols), "variables with zero variance\n")
+  data_numeric <- data_numeric[, !zero_var_cols]
+}
+
+# Scale the data after removing zero variance columns
+data_numeric <- scale(data_numeric)
+  
+# Check for any infinite or NA values
+data_numeric <- data_numeric[is.finite(rowSums(data_numeric)),]
+
+
+# Step 3: Determine Optimal Number of Clusters using ONLY Elbow Method
+#-------------------------------------------
+# Compute total within-cluster sum of squares for different k values
+max_k <- 10
+wss <- numeric(max_k)
+
+for (i in 1:max_k) {
+  km <- kmeans(data_numeric, centers = i, nstart = 25)
+  wss[i] <- km$tot.withinss
+}
+
+# Create data frame for plotting
+wss_df <- data.frame(k = 1:max_k, wss = wss)
+
+# Calculate percentage change in WSS
+wss_df$pct_change <- c(NA, -diff(wss_df$wss) / wss_df$wss[-length(wss_df$wss)] * 100)
+
+# Determine optimal k using the elbow method
+# Point of maximum curvature
+k_optimal_curve <- which.max(wss_df$pct_change[3:max_k]) + 1
+
+# Visual elbow method plot
+elbow_plot <- ggplot(wss_df, aes(x = k, y = wss)) +
+  geom_line(size = 1) +
+  geom_point(size = 3) +
+  labs(title = "Elbow Method for Optimal k", 
+       x = "Number of clusters (k)", 
+       y = "Total Within-Cluster Sum of Squares") +
+  theme_minimal() +
+  geom_vline(xintercept = k_optimal_curve, linetype = "dashed", color = "red") +
+  annotate("text", x = k_optimal_curve + 0.5, y = max(wss_df$wss) * 0.9, 
+           label = paste("Optimal k =", k_optimal_curve), color = "red") +
+  # Add underline to highlight the optimal k
+  geom_segment(x = k_optimal_curve - 0.3, xend = k_optimal_curve + 0.3, 
+               y = 0, yend = 0, color = "red", size = 2)
+
+print(elbow_plot)
+
+# Select optimal k based on elbow method
+optimal_k <- k_optimal_curve
+cat("Selected optimal number of clusters:", optimal_k, "\n")
+
+# Step 3b: Determine Optimal Number of Clusters using Gap Statistic
+#-------------------------------------------
+# Compute gap statistic
+cat("\nComputing Gap Statistic (this may take a moment)...\n")
+gap_stat <- cluster::clusGap(data_numeric, 
+                            FUN = kmeans,
+                            nstart = 25,
+                            K.max = max_k, 
+                            B = 50)  # Use 50 reference datasets
+
+# Print gap statistic summary
+print(gap_stat)
+
+# Create gap statistic plot
+gap_plot <- fviz_gap_stat(gap_stat) +
+  labs(title = "Gap Statistic Method for Optimal k") +
+  theme_minimal() +
+  geom_vline(xintercept = k_optimal_gap, linetype = "dashed", color = "blue") +
+  annotate("text", x = k_optimal_gap + 0.5, y = max(gap_values) * 0.9, 
+           label = paste("Optimal k (max gap) =", k_optimal_gap), color = "blue") #+
+  # geom_vline(xintercept = k_optimal_gap_se, linetype = "dashed", color = "darkgreen") +
+  # annotate("text", x = k_optimal_gap_se + 0.5, y = max(gap_values) * 0.8, 
+  #          label = paste("Optimal k (firstSE) =", k_optimal_gap_se), color = "darkgreen")
+
+print(gap_plot)
+
+# Step 4: Perform K-means Clustering
+#--------------------------------
+# Run k-means with optimal number of clusters
+km <- kmeans(data_numeric, centers = optimal_k, nstart = 25)
+
+# Report the number of iterations the algorithm took to converge
+cat("Number of iterations:", km$iter, "\n")
+
+# Step 5: Analyze Cluster Characteristics
+#------------------------------------
+# Find means of each cluster
+cluster_means <- aggregate(data_numeric, by = list(cluster = km$cluster), mean)
+
+# View the means of each cluster
+print(cluster_means)
+
+# Calculate cluster sizes
+cluster_sizes <- table(km$cluster)
+print(cluster_sizes)
+
+# Step 6: Visualize Clusters with Observation Labels
+#--------------------------------------------------
+# Perform PCA for visualization
+pca_result <- prcomp(data_numeric)
+pca_data <- as.data.frame(pca_result$x[,1:2])
+pca_data$cluster <- as.factor(km$cluster)
+pca_data$observation <- 1:nrow(pca_data)  # Add observation numbers
+
+# Create custom cluster visualization with observation labels
+cluster_plot <- ggplot(pca_data, aes(x = PC1, y = PC2, color = cluster)) +
+  geom_point(size = 3, alpha = 0.7) +
+  geom_text_repel(aes(label = observation), size = 3, show.legend = FALSE) +  # Add observation labels
+  stat_ellipse(aes(group = cluster), type = "norm", level = 0.95, linetype = "dashed") +
+  labs(title = "Cluster Visualization", x = "", y = "") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_line(color = "lightgray"),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "right",
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  scale_color_brewer(palette = "Set1")
+
+print(cluster_plot)
+
+
+# Assuming 'cluster_means' is the result from the aggregate function
+
+# Step 1: Remove the first column which is the cluster label (since it's not needed for this operation)
+cluster_means_values <- cluster_means[, -1]
+
+# Step 2: Find the cluster with the highest mean for each variable
+variable_clusters <- apply(cluster_means_values, 2, function(x) {
+  # Find the index of the cluster with the highest mean
+  max_cluster_index <- which.max(x)
+  return(max_cluster_index)
+})
+
+# Step 3: Convert the cluster index to cluster labels
+variable_cluster_labels <- rownames(cluster_means)[variable_clusters]
+
+# Step 4: Display the result showing which cluster each variable belongs to
+names(variable_cluster_labels) <- colnames(cluster_means_values)
+print(variable_cluster_labels)
+
+
+# After your existing cluster visualization code, add this section:
+
+# Step 7: Visualize Clusters with Centroids
+#------------------------------------------
+# Extract the centroids and project them onto the PCA space
+centroids <- km$centers
+centroids_pca <- predict(pca_result, centroids)
+centroids_df <- as.data.frame(centroids_pca[,1:2])
+centroids_df$cluster <- as.factor(1:nrow(centroids_df))
+
+# Create visualization with centroids highlighted but without the "Cluster X" labels
+centroid_plot <- ggplot() +
+  # Add the points
+  geom_point(data = pca_data, aes(x = PC1, y = PC2, color = cluster), size = 3, alpha = 0.5) +
+  # Add observation labels
+  geom_text_repel(data = pca_data, aes(x = PC1, y = PC2, label = observation, color = cluster), 
+                  size = 3, show.legend = FALSE) +
+  # Add cluster ellipses
+  stat_ellipse(data = pca_data, aes(x = PC1, y = PC2, color = cluster, group = cluster), 
+               type = "norm", level = 0.95, linetype = "dashed") +
+  # Add centroids as larger points with black borders (without text labels)
+  geom_point(data = centroids_df, aes(x = PC1, y = PC2, fill = cluster), 
+             size = 6, shape = 23, color = "black") +
+  # Styling
+  labs(title = "Cluster Visualization with Centroids", 
+       subtitle = paste("K-means clustering with k =", optimal_k),
+       x = paste0("PC1 (", round(summary(pca_result)$importance[2,1] * 100, 1), "% variance)"), 
+       y = paste0("PC2 (", round(summary(pca_result)$importance[2,2] * 100, 1), "% variance)")) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_line(color = "lightgray"),
+    panel.background = element_rect(fill = "white"),
+    legend.position = "right"
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1")
+
+print(centroid_plot)
+
+# Create a table of centroid values in original feature space
+# This helps interpret what each cluster represents
+centroid_table <- as.data.frame(km$centers)
+# If we want to scale back to original values (optional)
+# centroid_table <- scale(centroid_table, center = FALSE, scale = 1/attr(data_numeric, "scaled:scale"))
+# centroid_table <- scale(centroid_table, center = -attr(data_numeric, "scaled:center"), scale = FALSE)
+
+# Display the centroids table
+print(centroid_table)
+
+# Calculate distance of each point to its centroid
+distances_to_centroid <- numeric(nrow(data_numeric))
+for(i in 1:nrow(data_numeric)) {
+  cluster_id <- km$cluster[i]
+  centroid <- km$centers[cluster_id,]
+  distances_to_centroid[i] <- sqrt(sum((data_numeric[i,] - centroid)^2))
+}
+
+# Create data frame with distances
+distance_df <- data.frame(
+  observation = 1:length(distances_to_centroid),
+  cluster = km$cluster,
+  distance = distances_to_centroid
+)
+
+# Find the top 5 closest points to centroids for each cluster
+closest_points <- distance_df %>%
+  group_by(cluster) %>%
+  arrange(distance) %>%
+  slice_head(n = 5)
+
+# Find the top 5 furthest points from centroids for each cluster
+furthest_points <- distance_df %>%
+  group_by(cluster) %>%
+  arrange(desc(distance)) %>%
+  slice_head(n = 5)
+
+# Display the closest and furthest points
+cat("\nTop 5 observations closest to each centroid:\n")
+print(closest_points)
+
+cat("\nTop 5 observations furthest from each centroid:\n")
+print(furthest_points)
+
+```
+
+
+### Evaluation Metrics 
+
+```{r}
+library(cluster)      # Silhouette, dunn()
+library(fpc)          # calinhara(), cluster.stats()
+library(clValid)      # dunn()
+library(mclust)       # adjustedRandIndex(), variationInfo()
+library(proxy)        # dist()
+
+km <- kmeans(data_numeric, centers = 2)  # Replace '3' with your cluster count
+dist_matrix <- dist(data_numeric) 
+
+silhouette_score <- silhouette(km$cluster, dist_matrix)
+mean_sil <- mean(silhouette_score[, "sil_width"])
+print(paste("Silhouette Score:", mean_sil))
+
+
+ch_index <- calinhara(data_numeric, km$cluster)
+print(paste("Calinski-Harabasz Index:", ch_index))
+
+dunn_idx <- dunn(dist_matrix, km$cluster)
+print(paste("Dunn Index:", dunn_idx))
+```

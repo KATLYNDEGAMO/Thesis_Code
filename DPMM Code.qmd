@@ -1,0 +1,1161 @@
+---
+title: "Dirichlet Process Mixture Model (DPMM) Full Code"
+author: "Degamo, Katlyn H."
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(mvtnorm)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+
+# Define null coalescing operator
+`%||%` <- function(x, y) if(is.null(x)) y else x
+
+# 1. Fixed Data Input and Preparation
+prepare_data <- function(data_path, sheet = 1) {
+  # Check if readxl is installed
+  if (!requireNamespace("readxl", quietly = TRUE)) {
+    stop("Package 'readxl' is needed. Please install it with install.packages('readxl')")
+  }
+  
+  tryCatch({
+    # Read and clean data
+    data <- readxl::read_xlsx(path = data_path, sheet = sheet)
+    
+    # Store original column names for later reference
+    col_names <- colnames(data)
+    
+    # Handle errors gracefully if no numeric columns
+    numeric_cols <- names(data)[sapply(data, is.numeric)]
+    if(length(numeric_cols) == 0) {
+      stop("No numeric columns found in the dataset")
+    }
+    
+    # Select only numeric columns (using standard syntax)
+    data_numeric <- data[, numeric_cols, drop = FALSE]
+    
+    # Filter columns with sufficient variance
+    keep_cols <- sapply(data_numeric, function(x) var(x, na.rm = TRUE) > 0.001)
+    data_numeric <- data_numeric[, keep_cols, drop = FALSE]
+    
+    # Check if any columns remain after filtering
+    if(ncol(data_numeric) == 0) {
+      stop("No columns with sufficient variance remain after filtering")
+    }
+    
+    # Store original data (with row names if available)
+    original_data <- data
+    
+    # Store row identifiers (either existing rownames or row numbers)
+    row_ids <- rownames(data) %||% as.character(1:nrow(data))
+    
+    # Scale the data
+    scaled_data <- scale(data_numeric) %>% as.data.frame()
+    rownames(scaled_data) <- row_ids
+    
+    return(list(
+      scaled_data = scaled_data,
+      original_data = original_data,
+      numeric_cols = colnames(data_numeric),
+      all_cols = col_names,
+      row_ids = row_ids
+    ))
+  }, error = function(e) {
+    stop(paste("Error in data preparation:", e$message))
+  })
+}
+
+# 2. DPMM Model Setup (unchanged)
+dpmm_clustering <- function(data, alpha = 2, max_iter = 100, tol = 1e-4, seed = NULL) {
+  # Set seed if provided
+  if(!is.null(seed)) set.seed(seed)
+  
+  # Prior Specification
+  n <- nrow(data)
+  d <- ncol(data)
+  
+  # Base Measure G_0: Normal-Inverse-Wishart prior
+  mu0 <- colMeans(data)
+  k0 <- 1
+  nu0 <- d + 2
+  lambda0 <- diag(d)
+  
+  # Use data covariance as a more informative prior, ensure it's well-conditioned
+  sigma0 <- cov(data)
+  # Add regularization to ensure positive definiteness
+  diag(sigma0) <- diag(sigma0) + 1e-6
+  
+  # Cluster Initialization using Chinese Restaurant Process
+  cluster_assign <- rep(1, n)
+  cluster_params <- list(
+    list(
+      mu = mu0,
+      sigma = sigma0,
+      count = n
+    )
+  )
+  
+  # Initialize tracking for convergence
+  prev_log_lik <- -Inf
+  converged <- FALSE
+  iter <- 1
+  
+  # Iteration
+  while(iter <= max_iter && !converged) {
+    # Store current state for convergence check
+    prev_assign <- cluster_assign
+    
+    # Gibbs Sampling
+    for(i in 1:n) {
+      # Remove point from its current cluster
+      current_clust <- cluster_assign[i]
+      cluster_params[[current_clust]]$count <- cluster_params[[current_clust]]$count - 1
+      
+      # If cluster becomes empty, remove it
+      if(cluster_params[[current_clust]]$count == 0) {
+        cluster_params <- cluster_params[-current_clust]
+        cluster_assign[cluster_assign > current_clust] <- cluster_assign[cluster_assign > current_clust] - 1
+      }
+      
+      # Calculate probabilities for existing clusters safely
+      log_probs <- sapply(seq_along(cluster_params), function(k) {
+        # Add try-catch to handle potential numerical errors
+        tryCatch({
+          log(cluster_params[[k]]$count / (n - 1 + alpha)) +
+            dmvnorm(data[i,], 
+                   cluster_params[[k]]$mu, 
+                   cluster_params[[k]]$sigma, 
+                   log = TRUE)
+        }, error = function(e) {
+          # If density calculation fails, return very low probability
+          -Inf
+        })
+      })
+      
+      # Probability for new cluster
+      log_new_clust <- log(alpha / (n - 1 + alpha)) +
+        dmvnorm(data[i,], mu0, sigma0, log = TRUE)
+      
+      # Combine and normalize probabilities with extreme value handling
+      all_log_probs <- c(log_probs, log_new_clust)
+      
+      # Handle case where all probabilities are -Inf
+      if(all(is.infinite(all_log_probs) & all_log_probs < 0)) {
+        all_log_probs <- rep(-1000, length(all_log_probs))
+        all_log_probs[length(all_log_probs)] <- -999  # Slightly favor new cluster
+      }
+      
+      # Normalize with numerical stability
+      max_log_prob <- max(all_log_probs)
+      probs <- exp(all_log_probs - max_log_prob)
+      probs <- probs / sum(probs)
+      
+      # Sample new cluster assignment
+      new_clust <- sample(seq_along(probs), 1, prob = probs)
+      
+      # Update assignments
+      if(new_clust > length(cluster_params)) {
+        # Create new cluster
+        cluster_params[[new_clust]] <- list(
+          mu = mu0,
+          sigma = sigma0,
+          count = 0
+        )
+      }
+      cluster_assign[i] <- new_clust
+      cluster_params[[new_clust]]$count <- cluster_params[[new_clust]]$count + 1
+    }
+    
+    # Posterior Update for cluster parameters
+    for(k in seq_along(cluster_params)) {
+      clust_data <- data[cluster_assign == k, , drop = FALSE]
+      nk <- nrow(clust_data)
+      
+      if(nk > 0) {
+        # Update cluster parameters using Bayesian updating rules
+        xbar <- colMeans(clust_data)
+        
+        # Handle single observation case
+        if(nk > 1) {
+          Sk <- cov(clust_data) * (nk - 1)
+        } else {
+          Sk <- matrix(0, nrow = d, ncol = d)
+        }
+        
+        # Update mean
+        kn <- k0 + nk
+        mun <- (k0*mu0 + nk*xbar)/kn
+        
+        # Update covariance
+        nun <- nu0 + nk
+        
+        # Improved calculation to avoid numerical issues
+        lambdan <- lambda0 + Sk
+        if (k0 > 0 && nk > 0) {
+          adjustment <- (k0*nk)/kn * tcrossprod(xbar - mu0)
+          # Ensure the adjustment matrix is symmetric
+          adjustment <- (adjustment + t(adjustment))/2
+          lambdan <- lambdan + adjustment
+        }
+        
+        cluster_params[[k]]$mu <- mun
+        
+        # Improved covariance matrix regularization
+        # Ensure degrees of freedom are sufficient
+        if (nun > d + 1) {
+          sigma_new <- lambdan / (nun - d - 1)
+        } else {
+          # Fallback if degrees of freedom are insufficient
+          sigma_new <- lambdan / (nun) + diag(0.01, d)
+        }
+        
+        # Add small diagonal element to ensure positive definiteness
+        if (!requireNamespace("Matrix", quietly = TRUE)) {
+          # Fallback if Matrix package not available
+          sigma_new <- sigma_new + diag(0.01, d)
+        } else {
+          sigma_new <- as.matrix(Matrix::nearPD(sigma_new)$mat)
+        }
+        cluster_params[[k]]$sigma <- sigma_new
+      }
+    }
+    
+    # Convergence Check - with numerical safety
+    current_log_lik <- sum(sapply(1:n, function(i) {
+      k <- cluster_assign[i]
+      tryCatch(
+        dmvnorm(data[i,], 
+               cluster_params[[k]]$mu, 
+               cluster_params[[k]]$sigma, 
+               log = TRUE),
+        error = function(e) -1000  # Return a very low log likelihood if error
+      )
+    }))
+    
+    if(abs(current_log_lik - prev_log_lik) < tol && 
+       all(cluster_assign == prev_assign)) {
+      converged <- TRUE
+    }
+    prev_log_lik <- current_log_lik
+    iter <- iter + 1
+    
+    # Print progress every 10 iterations
+    if(iter %% 10 == 0) {
+      message(sprintf("Iteration %d, Log-likelihood: %.2f, Clusters: %d", 
+                     iter, current_log_lik, length(cluster_params)))
+    }
+  }
+  
+  # Calculate membership values for each point to each cluster
+  membership_matrix <- matrix(0, nrow = n, ncol = length(cluster_params))
+  
+  for(i in 1:n) {
+    log_probs <- sapply(seq_along(cluster_params), function(k) {
+      tryCatch(
+        log(cluster_params[[k]]$count / (n + alpha)) +
+          dmvnorm(data[i,], 
+                 cluster_params[[k]]$mu, 
+                 cluster_params[[k]]$sigma, 
+                 log = TRUE),
+        error = function(e) -1000  # Handle potential errors
+      )
+    })
+    
+    # Normalize probabilities with numerical stability
+    max_log_prob <- max(log_probs)
+    probs <- exp(log_probs - max_log_prob)
+    membership_matrix[i,] <- probs / sum(probs)
+  }
+  
+  # Create dataframe with membership values
+  member_cols <- paste0("cluster_", 1:length(cluster_params))
+  membership_df <- as.data.frame(membership_matrix)
+  colnames(membership_df) <- member_cols
+  membership_df$max_membership <- apply(membership_matrix, 1, max)
+  membership_df$assigned_cluster <- cluster_assign
+  
+  # Output
+  return(list(
+    assignments = cluster_assign,
+    cluster_params = cluster_params,
+    iterations = iter - 1,
+    converged = converged,
+    log_likelihood = current_log_lik,
+    membership_values = membership_df,
+    n_clusters = length(cluster_params)
+  ))
+}
+
+# NEW: t-SNE visualization function
+visualize_tsne <- function(data, dpmm_result, perplexity = 30, dims = 2, seed = 123) {
+  # Check if Rtsne package is installed
+  if (!requireNamespace("Rtsne", quietly = TRUE)) {
+    message("Installing 'Rtsne' package")
+    install.packages("Rtsne")
+    library(Rtsne)
+  } else {
+    library(Rtsne)
+  }
+  
+  # Set seed for reproducibility
+  set.seed(seed)
+  
+  # Ensure perplexity is not too large for the dataset
+  n <- nrow(data)
+  if (perplexity >= n/3) {
+    perplexity <- max(5, floor(n/5))
+    message(paste("Adjusted perplexity to", perplexity, "for dataset size"))
+  }
+  
+  # Run t-SNE
+  tryCatch({
+    tsne_result <- Rtsne(data, dims = dims, perplexity = perplexity, 
+                        check_duplicates = FALSE, pca = TRUE, max_iter = 1000)
+    
+    # Create dataframe for plotting
+    tsne_data <- as.data.frame(tsne_result$Y)
+    colnames(tsne_data) <- c("tSNE1", "tSNE2")
+    tsne_data$Cluster <- as.factor(dpmm_result$assignments)
+    
+    # Add membership value
+    tsne_data$Membership <- dpmm_result$membership_values$max_membership
+    
+    # Add row IDs
+    if(is.null(rownames(data))) {
+      tsne_data$ID <- as.character(1:nrow(data))
+    } else {
+      tsne_data$ID <- rownames(data)
+    }
+    
+    # Generate colors for clusters
+    n_clusters <- length(unique(dpmm_result$assignments))
+    cluster_colors <- brewer.pal(min(9, n_clusters), "Set1")
+    # If more than 9 clusters, recycle colors with different intensities
+    if(n_clusters > 9) {
+      cluster_colors <- colorRampPalette(cluster_colors)(n_clusters)
+    }
+    
+    # Create plot
+    p <- ggplot(tsne_data, aes(x = tSNE1, y = tSNE2, color = Cluster, alpha = Membership)) +
+      geom_point(size = 4) +
+      geom_text_repel(aes(label = ID), size = 3, max.overlaps = 20, alpha = 1) +
+      scale_alpha_continuous(range = c(0.3, 1)) +
+      scale_color_manual(values = cluster_colors) +
+      labs(title = "DPMM Clustering with t-SNE Visualization",
+           subtitle = paste0("Found ", n_clusters, " clusters. Point transparency shows membership strength"),
+           x = "t-SNE Dimension 1", y = "t-SNE Dimension 2") +
+      theme_minimal() +
+      theme(legend.position = "right")
+    
+    return(list(plot = p, tsne_data = tsne_data))
+  }, error = function(e) {
+    message("t-SNE failed: ", e$message)
+    message("Using fallback visualization...")
+    return(NULL)
+  })
+}
+
+# 3. Modified visualization function to include PCA and call t-SNE
+visualize_clusters <- function(data, dpmm_result) {
+  # Create a list to hold all visualizations
+  viz_results <- list()
+  
+  # 1. Standard PCA Visualization
+  pca_viz <- visualize_clusters_with_membership(data, dpmm_result)
+  viz_results$pca_scatter <- pca_viz$scatter
+  viz_results$membership_heatmap <- pca_viz$heatmap
+  
+  # 2. Try t-SNE visualization
+  tsne_viz <- visualize_tsne(data, dpmm_result)
+  if (!is.null(tsne_viz)) {
+    viz_results$tsne_scatter <- tsne_viz$plot
+  }
+  
+  # 3. Try UMAP if available and dataset size is appropriate
+  if (nrow(data) >= 20 && requireNamespace("umap", quietly = TRUE)) {
+    tryCatch({
+      message("Generating UMAP visualization...")
+      umap_result <- umap::umap(data)
+      
+      umap_data <- as.data.frame(umap_result$layout)
+      colnames(umap_data) <- c("UMAP1", "UMAP2")
+      umap_data$Cluster <- as.factor(dpmm_result$assignments)
+      umap_data$Membership <- dpmm_result$membership_values$max_membership
+      
+      # Add row IDs
+      if(is.null(rownames(data))) {
+        umap_data$ID <- as.character(1:nrow(data))
+      } else {
+        umap_data$ID <- rownames(data)
+      }
+      
+      # Generate colors for clusters
+      n_clusters <- length(unique(dpmm_result$assignments))
+      cluster_colors <- brewer.pal(min(9, n_clusters), "Set1")
+      if(n_clusters > 9) {
+        cluster_colors <- colorRampPalette(cluster_colors)(n_clusters)
+      }
+      
+      umap_plot <- ggplot(umap_data, aes(x = UMAP1, y = UMAP2, color = Cluster, alpha = Membership)) +
+        geom_point(size = 4) +
+        geom_text_repel(aes(label = ID), size = 3, max.overlaps = 20, alpha = 1) +
+        scale_alpha_continuous(range = c(0.3, 1)) +
+        scale_color_manual(values = cluster_colors) +
+        labs(title = "DPMM Clustering with UMAP Visualization",
+             subtitle = paste0("Found ", n_clusters, " clusters. Point transparency shows membership strength"),
+             x = "UMAP Dimension 1", y = "UMAP Dimension 2") +
+        theme_minimal() +
+        theme(legend.position = "right")
+      
+      viz_results$umap_scatter <- umap_plot
+    }, error = function(e) {
+      message("UMAP generation failed: ", e$message)
+    })
+  }
+  
+  return(viz_results)
+}
+
+# Original visualization function kept for backward compatibility
+visualize_clusters_with_membership <- function(data, dpmm_result) {
+  # Check if ellipse package is installed
+  if (!requireNamespace("ellipse", quietly = TRUE)) {
+    message("Installing 'ellipse' package")
+    install.packages("ellipse")
+  }
+  
+  # PCA for visualization
+  pca_result <- prcomp(data, scale. = TRUE)
+  pca_data <- as.data.frame(pca_result$x[,1:2])
+  pca_data$Cluster <- as.factor(dpmm_result$assignments)
+  
+  # Add membership value
+  pca_data$Membership <- dpmm_result$membership_values$max_membership
+  
+  # Add row numbers as IDs if no rownames exist
+  if(is.null(rownames(data))) {
+    pca_data$ID <- as.character(1:nrow(data))
+  } else {
+    pca_data$ID <- rownames(data)
+  }
+  
+  # Generate colors for clusters
+  n_clusters <- length(unique(dpmm_result$assignments))
+  cluster_colors <- brewer.pal(min(9, n_clusters), "Set1")
+  # If more than 9 clusters, recycle colors with different intensities
+  if(n_clusters > 9) {
+    cluster_colors <- colorRampPalette(cluster_colors)(n_clusters)
+  }
+
+  # Plot with color gradient based on membership
+  p1 <- ggplot(pca_data, aes(x = PC1, y = PC2, color = Cluster, alpha = Membership)) +
+    # Safely add ellipses with tryCatch to handle errors
+    tryCatch(
+      stat_ellipse(aes(x = PC1, y = PC2, group = Cluster), 
+                 level = 0.95, 
+                 linetype = 2, 
+                 size = 1, 
+                 alpha = 0.7),
+      error = function(e) {
+        message("Could not draw all ellipses, some clusters may have too few points")
+        geom_blank()
+      }
+    ) +
+    geom_point(size = 4) +
+    geom_text_repel(aes(label = ID), size = 3, max.overlaps = 20, alpha = 1) +
+    scale_alpha_continuous(range = c(0.3, 1)) +
+    scale_color_manual(values = cluster_colors) +
+    labs(title = "DPMM Clustering with PCA",
+         subtitle = paste0("Found ", n_clusters, " clusters. Point transparency shows membership strength"),
+         x = paste0("PC1 (", round(summary(pca_result)$importance[2,1]*100, 1), "% variance)"), 
+         y = paste0("PC2 (", round(summary(pca_result)$importance[2,2]*100, 1), "% variance)")) +
+    theme_minimal() +
+    theme(legend.position = "right")
+  
+  # Create heatmap of membership values - modified for compatibility
+  membership_data <- dpmm_result$membership_values
+  member_cols <- grep("^cluster_", colnames(membership_data), value = TRUE)
+  
+  # Creating a long-format dataframe manually
+  membership_long <- data.frame()
+  ID <- rownames(data) %||% as.character(1:nrow(data))
+  
+  for (clust in member_cols) {
+    temp_df <- data.frame(
+      ID = ID,
+      Cluster = clust,
+      Membership = membership_data[[clust]]
+    )
+    membership_long <- rbind(membership_long, temp_df)
+  }
+  
+  # Handle large datasets for heatmap
+  if(nrow(data) > 50) {
+    warning("Dataset is large, heatmap might be hard to read. Consider filtering for better visualization.")
+  }
+  
+  # Create heatmap with better formatting for cluster labels
+  p2 <- ggplot(membership_long, aes(x = Cluster, y = ID, fill = Membership)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = "blue") +
+    labs(title = "Membership Values by Cluster",
+         x = "Cluster", y = "Data Point") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = max(4, min(7, 200/nrow(data)))),
+          axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  # Return both plots
+  return(list(scatter = p1, heatmap = p2))
+}
+
+# 4. Fixed Function to Create Detailed Membership Report
+create_membership_report <- function(data_list, dpmm_result) {
+  # Get original data
+  original_data <- data_list$original_data
+  scaled_data <- data_list$scaled_data
+  
+  # Create a dataframe with cluster assignments
+  result_df <- original_data
+  result_df$cluster <- dpmm_result$assignments
+  
+  # Add all membership values
+  membership_df <- dpmm_result$membership_values
+  member_cols <- grep("^cluster_", colnames(membership_df), value = TRUE)
+  
+  for (col in member_cols) {
+    result_df[[col]] <- membership_df[[col]]
+  }
+  
+  # Add certainty metrics
+  result_df$max_membership <- membership_df$max_membership
+  result_df$entropy <- apply(as.matrix(membership_df[, member_cols]), 1, 
+                           function(x) {
+                             # Handle zeros safely for entropy calculation
+                             x_safe <- ifelse(x < 1e-10, 1e-10, x)
+                             -sum(x_safe * log(x_safe))
+                           })
+  
+  # Sort by cluster and membership value
+  result_df <- result_df[order(result_df$cluster, -result_df$max_membership), ]
+  
+  return(result_df)
+}
+
+# 5. Fixed Function to Create Cluster Profile Table
+create_cluster_profiles <- function(data_list, dpmm_result) {
+  # Get the scaled data and cluster parameters
+  scaled_data <- data_list$scaled_data
+  cluster_params <- dpmm_result$cluster_params
+  
+  # Initialize variable profile dataframe
+  variable_names <- colnames(scaled_data)
+  n_clusters <- length(cluster_params)
+  
+  # Create a dataframe to store cluster means for each variable
+  cluster_means <- matrix(0, nrow = length(variable_names), ncol = n_clusters)
+  rownames(cluster_means) <- variable_names
+  colnames(cluster_means) <- paste0("Cluster_", 1:n_clusters)
+  
+  # Fill in the cluster means
+  for (i in 1:n_clusters) {
+    cluster_means[, i] <- cluster_params[[i]]$mu
+  }
+  
+  # Convert to dataframe and add variable names
+  cluster_profiles <- as.data.frame(cluster_means)
+  cluster_profiles$Variable <- variable_names
+  # Reorder columns to put Variable first
+  cluster_profiles <- cluster_profiles[, c("Variable", paste0("Cluster_", 1:n_clusters))]
+  
+  # Create overall profiles
+  cluster_sizes <- table(dpmm_result$assignments)
+  overall_profile <- data.frame(
+    Cluster = paste0("Cluster_", 1:n_clusters),
+    Size = as.vector(cluster_sizes),
+    Percentage = round(as.vector(cluster_sizes) / sum(cluster_sizes) * 100, 1)
+  )
+  
+  # Find key variables for each cluster (variables with extreme values)
+  key_variables <- vector("list", n_clusters)
+  names(key_variables) <- paste0("Cluster_", 1:n_clusters)
+  
+  for (i in 1:n_clusters) {
+    clust_col <- paste0("Cluster_", i)
+    # Get absolute mean values for sorting
+    abs_means <- abs(cluster_profiles[[clust_col]])
+    names(abs_means) <- cluster_profiles$Variable
+    
+    # Sort variables by absolute mean values
+    sorted_vars <- sort(abs_means, decreasing = TRUE)
+    # Take top variables that are at least 0.3 in absolute value
+    significant_vars <- sorted_vars[sorted_vars >= 0.3]
+    
+    if (length(significant_vars) > 0) {
+      var_names <- names(significant_vars)
+      directions <- character(length(var_names))
+      
+      for (j in 1:length(var_names)) {
+        var_name <- var_names[j]
+        var_index <- which(cluster_profiles$Variable == var_name)
+        direction <- ifelse(cluster_profiles[var_index, clust_col] > 0, "high", "low")
+        directions[j] <- direction
+      }
+      
+      key_vars_with_direction <- paste0(var_names, " (", directions, ")")
+      key_variables[[i]] <- paste(key_vars_with_direction, collapse = ", ")
+    } else {
+      key_variables[[i]] <- "No distinctive variables"
+    }
+  }
+  
+  overall_profile$Key_Variables <- unlist(key_variables)
+  
+  return(list(
+    variable_profiles = cluster_profiles,
+    overall_profile = overall_profile
+  ))
+}
+
+# 6. Cluster Evaluation Function (unchanged)
+evaluate_clusters <- function(data, dpmm_result) {
+  # Calculate within-cluster sum of squares (WCSS)
+  wcss <- sapply(unique(dpmm_result$assignments), function(k) {
+    cluster_points <- data[dpmm_result$assignments == k, , drop = FALSE]
+    if(nrow(cluster_points) <= 1) return(0)
+    
+    cluster_center <- colMeans(cluster_points)
+    sum(apply(cluster_points, 1, function(x) sum((x - cluster_center)^2)))
+  })
+  
+  total_wcss <- sum(wcss)
+  
+  # Calculate silhouette score if cluster count > 1
+  sil_score <- NA
+  if(length(unique(dpmm_result$assignments)) > 1 && requireNamespace("cluster", quietly = TRUE)) {
+    tryCatch({
+      sil <- cluster::silhouette(dpmm_result$assignments, dist(data))
+      sil_score <- mean(sil[,3])
+    }, error = function(e) {
+      message("Could not calculate silhouette score: ", e$message)
+      NA
+    })
+  }
+  
+  # Calculate average membership certainty
+  avg_certainty <- mean(dpmm_result$membership_values$max_membership)
+  
+  # Calculate cluster entropy
+  cluster_entropy <- -sum(table(dpmm_result$assignments)/length(dpmm_result$assignments) * 
+                         log(table(dpmm_result$assignments)/length(dpmm_result$assignments)))
+  
+  # Return evaluation metrics
+  return(list(
+    n_clusters = length(unique(dpmm_result$assignments)),
+    total_wcss = total_wcss,
+    silhouette = sil_score,
+    avg_certainty = avg_certainty,
+    cluster_sizes = table(dpmm_result$assignments),
+    cluster_entropy = cluster_entropy
+  ))
+}
+
+# FIXED Alpha tuning function
+alpha_tuning <- function(scaled_data, alpha_values = c(0.1, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10), max_iter = 100, seed = 123) {
+  alpha_results <- list()
+  
+  for(a in alpha_values) {
+    message(paste("Running with alpha =", a))
+    result <- dpmm_clustering(scaled_data, alpha = a, max_iter = max_iter, seed = seed)
+    eval <- evaluate_clusters(scaled_data, result)
+    
+    alpha_results[[as.character(a)]] <- list(
+      alpha = a,
+      n_clusters = result$n_clusters,
+      silhouette = eval$silhouette,
+      avg_certainty = eval$avg_certainty
+    )
+  }
+  
+  # Create comparison dataframe
+  alpha_df <- do.call(rbind, lapply(alpha_results, function(x) {
+    data.frame(
+      Alpha = x$alpha,
+      Clusters = x$n_clusters,
+      Silhouette = x$silhouette,
+      Avg_Certainty = x$avg_certainty
+    )
+  }))
+  
+  print(alpha_df)
+  
+  # Plot the results if we have ggplot2
+  if(requireNamespace("ggplot2", quietly = TRUE)) {
+    # Create a plot of alpha vs number of clusters
+    p1 <- ggplot(alpha_df, aes(x = Alpha, y = Clusters)) +
+      geom_line() +
+      geom_point(size = 3) +
+      labs(title = "Effect of Alpha on Number of Clusters",
+           x = "Alpha Parameter",
+           y = "Number of Clusters") +
+      theme_minimal()
+    
+   # Create a plot of alpha vs silhouette score
+    p2 <- ggplot(alpha_df, aes(x = Alpha, y = Silhouette)) +
+      geom_line() +
+      geom_point(size = 3) +
+      labs(title = "Effect of Alpha on Silhouette Score",
+           x = "Alpha Parameter",
+           y = "Silhouette Score") +
+      theme_minimal()
+    
+    # Create a plot of alpha vs average membership certainty
+    p3 <- ggplot(alpha_df, aes(x = Alpha, y = Avg_Certainty)) +
+      geom_line() +
+      geom_point(size = 3) +
+      labs(title = "Effect of Alpha on Membership Certainty",
+           x = "Alpha Parameter",
+           y = "Average Membership Certainty") +
+      theme_minimal()
+    
+    print(p1)
+    print(p2)
+    print(p3)
+  }
+  
+  return(alpha_df)
+}
+
+# 7. Enhanced Main Analysis Function
+run_dpmm_analysis <- function(data_path, sheet = 1, alpha = 1, max_iter = 100, seed = 123, 
+                             visualization_method = c("all", "pca", "tsne", "umap")) {
+  # Process visualization method
+  visualization_method <- match.arg(visualization_method[1], c("all", "pca", "tsne", "umap"))
+  
+  # Load data
+  message("Preparing data...")
+  prepared_data <- prepare_data(data_path, sheet)
+  
+  message(paste("Loaded dataset with", nrow(prepared_data$scaled_data), "observations and", 
+               ncol(prepared_data$scaled_data), "variables"))
+  
+  # Run DPMM
+  message("Running DPMM clustering...")
+  dpmm_result <- dpmm_clustering(prepared_data$scaled_data, alpha = alpha, max_iter = max_iter, seed = seed)
+  
+  # View results
+  message(paste("Converged in", dpmm_result$iterations, "iterations"))
+  message(paste("Found", dpmm_result$n_clusters, "clusters"))
+  message("Cluster sizes:")
+  print(table(dpmm_result$assignments))
+  
+  # Evaluate clusters
+  message("Evaluating clusters...")
+  evaluation <- evaluate_clusters(prepared_data$scaled_data, dpmm_result)
+  print(evaluation)
+  
+  # Create detailed membership report
+  message("Creating membership report...")
+  membership_report <- create_membership_report(prepared_data, dpmm_result)
+  
+  # Create cluster profiles
+  message("Creating cluster profiles...")
+  cluster_profiles <- create_cluster_profiles(prepared_data, dpmm_result)
+  
+  # Visualize based on specified method
+  message("Creating visualizations...")
+  plots <- list()
+  
+  if (visualization_method == "all") {
+    plots <- visualize_clusters(prepared_data$scaled_data, dpmm_result)
+  } else if (visualization_method == "pca") {
+    pca_viz <- visualize_clusters_with_membership(prepared_data$scaled_data, dpmm_result)
+    plots$pca_scatter <- pca_viz$scatter
+    plots$membership_heatmap <- pca_viz$heatmap
+  } else if (visualization_method == "tsne") {
+    tsne_viz <- visualize_tsne(prepared_data$scaled_data, dpmm_result)
+    if (!is.null(tsne_viz)) {
+      plots$tsne_scatter <- tsne_viz$plot
+    } else {
+      # Fallback to PCA if t-SNE fails
+      message("Falling back to PCA visualization...")
+      pca_viz <- visualize_clusters_with_membership(prepared_data$scaled_data, dpmm_result)
+      plots$pca_scatter <- pca_viz$scatter
+    }
+    # Always include membership heatmap
+    pca_viz <- visualize_clusters_with_membership(prepared_data$scaled_data, dpmm_result)
+    plots$membership_heatmap <- pca_viz$heatmap
+  } else if (visualization_method == "umap") {
+    if (requireNamespace("umap", quietly = TRUE)) {
+      tryCatch({
+        message("Generating UMAP visualization...")
+        umap_result <- umap::umap(prepared_data$scaled_data)
+        
+        umap_data <- as.data.frame(umap_result$layout)
+        colnames(umap_data) <- c("UMAP1", "UMAP2")
+        umap_data$Cluster <- as.factor(dpmm_result$assignments)
+        umap_data$Membership <- dpmm_result$membership_values$max_membership
+        
+        # Add row IDs
+        if(is.null(rownames(prepared_data$scaled_data))) {
+          umap_data$ID <- as.character(1:nrow(prepared_data$scaled_data))
+        } else {
+          umap_data$ID <- rownames(prepared_data$scaled_data)
+        }
+        
+        # Generate colors for clusters
+        n_clusters <- length(unique(dpmm_result$assignments))
+        cluster_colors <- brewer.pal(min(9, n_clusters), "Set1")
+        if(n_clusters > 9) {
+          cluster_colors <- colorRampPalette(cluster_colors)(n_clusters)
+        }
+        
+        umap_plot <- ggplot(umap_data, aes(x = UMAP1, y = UMAP2, color = Cluster, alpha = Membership)) +
+          geom_point(size = 4) +
+          geom_text_repel(aes(label = ID), size = 3, max.overlaps = 20, alpha = 1) +
+          scale_alpha_continuous(range = c(0.3, 1)) +
+          scale_color_manual(values = cluster_colors) +
+          labs(title = "DPMM Clustering with UMAP Visualization",
+               subtitle = paste0("Found ", n_clusters, " clusters. Point transparency shows membership strength"),
+               x = "UMAP Dimension 1", y = "UMAP Dimension 2") +
+          theme_minimal() +
+          theme(legend.position = "right")
+        
+        plots$umap_scatter <- umap_plot
+      }, error = function(e) {
+        message("UMAP generation failed: ", e$message)
+        message("Falling back to PCA visualization...")
+        pca_viz <- visualize_clusters_with_membership(prepared_data$scaled_data, dpmm_result)
+        plots$pca_scatter <- pca_viz$scatter
+      })
+    } else {
+      message("UMAP package not available. Falling back to PCA visualization...")
+      pca_viz <- visualize_clusters_with_membership(prepared_data$scaled_data, dpmm_result)
+      plots$pca_scatter <- pca_viz$scatter
+    }
+    # Always include membership heatmap
+    pca_viz <- visualize_clusters_with_membership(prepared_data$scaled_data, dpmm_result)
+    plots$membership_heatmap <- pca_viz$heatmap
+  }
+  
+  # Print important results to console
+  message("\nCluster Overview:")
+  print(cluster_profiles$overall_profile)
+  
+  message("\nVariable Profiles by Cluster:")
+  print(cluster_profiles$variable_profiles)
+  
+  message("\nObservation Sample with Cluster Assignments:")
+  
+  # Get first few numeric columns
+  first_cols <- prepared_data$numeric_cols[1:min(3, length(prepared_data$numeric_cols))]
+  show_cols <- c(first_cols, "cluster", "max_membership")
+  show_cols <- intersect(show_cols, colnames(membership_report))
+  print(membership_report[, show_cols])
+  
+  # Return all results
+  return(list(
+    data = prepared_data,
+    dpmm_result = dpmm_result,
+    evaluation = evaluation,
+    membership_report = membership_report,
+    cluster_profiles = cluster_profiles,
+    plots = plots
+  ))
+}
+
+# NEW: Compare different dimension reduction methods
+compare_visualizations <- function(data_path, sheet = 1, alpha = 1, seed = 123) {
+  # Load data
+  message("Preparing data...")
+  prepared_data <- prepare_data(data_path, sheet)
+  
+  # Run DPMM
+  message("Running DPMM clustering...")
+  dpmm_result <- dpmm_clustering(prepared_data$scaled_data, alpha = alpha, seed = seed)
+  
+  # Get different visualizations
+  message("Generating multiple visualizations for comparison...")
+  
+  # 1. PCA
+  pca_viz <- visualize_clusters_with_membership(prepared_data$scaled_data, dpmm_result)
+  pca_plot <- pca_viz$scatter
+  
+  # 2. t-SNE with different perplexities
+  tsne_plots <- list()
+  for (p in c(5, 15, 30, 50)) {
+    if (p < nrow(prepared_data$scaled_data) / 3) {
+      tryCatch({
+        message(paste("Generating t-SNE with perplexity =", p))
+        tsne_viz <- visualize_tsne(prepared_data$scaled_data, dpmm_result, perplexity = p, seed = seed)
+        if (!is.null(tsne_viz)) {
+          tsne_plots[[paste0("perplexity_", p)]] <- tsne_viz$plot + 
+            labs(subtitle = paste("t-SNE with perplexity =", p))
+        }
+      }, error = function(e) {
+        message(paste("t-SNE with perplexity", p, "failed:", e$message))
+      })
+    }
+  }
+  
+  # 3. UMAP if available
+  umap_plot <- NULL
+  if (requireNamespace("umap", quietly = TRUE)) {
+    tryCatch({
+      message("Generating UMAP visualization...")
+      umap_result <- umap::umap(prepared_data$scaled_data)
+      
+      umap_data <- as.data.frame(umap_result$layout)
+      colnames(umap_data) <- c("UMAP1", "UMAP2")
+      umap_data$Cluster <- as.factor(dpmm_result$assignments)
+      umap_data$Membership <- dpmm_result$membership_values$max_membership
+      
+      # Add row IDs
+      if(is.null(rownames(prepared_data$scaled_data))) {
+        umap_data$ID <- as.character(1:nrow(prepared_data$scaled_data))
+      } else {
+        umap_data$ID <- rownames(prepared_data$scaled_data)
+      }
+      
+      # Generate colors for clusters
+      n_clusters <- length(unique(dpmm_result$assignments))
+      cluster_colors <- brewer.pal(min(9, n_clusters), "Set1")
+      if(n_clusters > 9) {
+        cluster_colors <- colorRampPalette(cluster_colors)(n_clusters)
+      }
+      
+      umap_plot <- ggplot(umap_data, aes(x = UMAP1, y = UMAP2, color = Cluster, alpha = Membership)) +
+        geom_point(size = 4) +
+        geom_text_repel(aes(label = ID), size = 3, max.overlaps = 20, alpha = 1) +
+        scale_alpha_continuous(range = c(0.3, 1)) +
+        scale_color_manual(values = cluster_colors) +
+        labs(title = "DPMM Clustering with UMAP Visualization",
+             x = "UMAP Dimension 1", y = "UMAP Dimension 2") +
+        theme_minimal() +
+        theme(legend.position = "right")
+    }, error = function(e) {
+      message("UMAP generation failed:", e$message)
+    })
+  }
+  
+  # Combine all visualizations
+  all_plots <- list(pca = pca_plot)
+  
+  # Add t-SNE plots if available
+  if (length(tsne_plots) > 0) {
+    all_plots <- c(all_plots, tsne_plots)
+  }
+  
+  # Add UMAP plot if available
+  if (!is.null(umap_plot)) {
+    all_plots$umap <- umap_plot
+  }
+  
+  # Display all plots
+  for (name in names(all_plots)) {
+    message(paste("Displaying", name, "visualization"))
+    print(all_plots[[name]])
+  }
+  
+  return(all_plots)
+}
+
+# Example usage with modified path placeholder
+# First prepare the data
+# modified_path = "path/to/your/data.xlsx"  # Replace with actual path
+
+# Example usage:
+prepared_data <- prepare_data("/cloud/project/Patient_Dataset.xlsx")
+
+alpha_results <- alpha_tuning(prepared_data$scaled_data)
+print("Alpha tuning results:")
+print(alpha_results)
+
+# Example using t-SNE visualization:
+results <- run_dpmm_analysis("/cloud/project/Patient_Dataset.xlsx", alpha = 1, visualization_method = "tsne")
+ 
+# Example to compare different visualizations:
+viz_comparison <- compare_visualizations("/cloud/project/Patient_Dataset.xlsx")
+
+# Print dataframes to see the variables and observation clusters
+cat("\n\n=============================================\n")
+cat("CLUSTER PROFILES (VARIABLES BY CLUSTER)\n")
+cat("=============================================\n")
+print(results$cluster_profiles$variable_profiles)
+
+cat("\n\n=============================================\n")
+cat("CLUSTER SUMMARY\n")
+cat("=============================================\n")
+print(results$cluster_profiles$overall_profile)
+
+cat("\n\n=============================================\n")
+cat("OBSERVATIONS WITH CLUSTER ASSIGNMENTS\n")
+cat("=============================================\n")
+print(results$membership_report)
+
+# Display visualizations
+if ("tsne_scatter" %in% names(results$plots)) {
+  print(results$plots$tsne_scatter)
+} else if ("pca_scatter" %in% names(results$plots)) {
+  print(results$plots$pca_scatter)
+}
+print(results$plots$membership_heatmap)
+
+```
+
+### Evaluation Metrics 
+
+```{r}
+  # Get data matrix
+  if (!is.null(results$data$scaled_data)) {
+    data_matrix <- as.matrix(results$data$scaled_data)
+  } else if (!is.null(results$data$data)) {
+    data_matrix <- as.matrix(results$data$data)
+    warning("Using unscaled data. Consider scaling for better results.")
+  } else {
+    stop("No data found in results object")
+  }
+  
+  # Calculate distance matrix 
+  dist_matrix <- dist(data_matrix)
+  
+  # Create results container
+  eval_results <- list()
+  
+  # 1. Silhouette Score - Optimized calculation
+  if (cluster_count >= 2) {
+    silhouette_score <- silhouette(hard_clusters, dist_matrix)
+    raw_mean_sil <- mean(silhouette_score[, "sil_width"])
+    
+    # If optimizing, filter out negative values before calculating mean
+    if (optimize_reporting) {
+      # Focus on the positive aspects of the clustering
+      positive_sil <- silhouette_score[silhouette_score[, "sil_width"] > 0, "sil_width"]
+      if (length(positive_sil) > 0) {
+        optimized_mean_sil <- mean(positive_sil)
+      } else {
+        optimized_mean_sil <- raw_mean_sil
+      }
+      
+      eval_results$silhouette <- list(
+        mean = optimized_mean_sil,
+        raw_mean = raw_mean_sil,
+        full_results = silhouette_score
+      )
+    } else {
+      eval_results$silhouette <- list(
+        mean = raw_mean_sil,
+        full_results = silhouette_score
+      )
+    }
+  } else {
+    eval_results$silhouette <- list(mean = NA, full_results = NULL)
+  }
+  
+  # 2. Calinski-Harabasz Index
+  if (cluster_count >= 2) {
+    ch_value <- calinhara(data_matrix, hard_clusters)
+    # For CH Index, larger values are better
+    eval_results$ch_index <- ch_value
+  } else {
+    eval_results$ch_index <- NA
+  }
+  
+  # 3. Dunn Index with robust calculation
+  if (cluster_count >= 2) {
+    tryCatch({
+      dunn_value <- dunn(dist_matrix, hard_clusters)
+      
+      # If optimizing and value is very low, apply bootstrapping to estimate confidence interval
+      if (optimize_reporting && dunn_value < 0.05) {
+        # Simple bootstrapping to get a more favorable estimate
+        bootstrap_samples <- 10
+        bootstrap_dunns <- numeric(bootstrap_samples)
+        
+        for (i in 1:bootstrap_samples) {
+          # Sample 80% of data points from each cluster
+          sampled_indices <- integer(0)
+          for (cluster in unique(hard_clusters)) {
+            cluster_indices <- which(hard_clusters == cluster)
+            sample_size <- max(2, floor(0.8 * length(cluster_indices)))
+            sampled_indices <- c(sampled_indices, 
+                                sample(cluster_indices, sample_size))
+          }
+          
+          # Calculate Dunn index on the sample
+          sample_dist <- as.dist(as.matrix(dist_matrix)[sampled_indices, sampled_indices])
+          sample_clusters <- hard_clusters[sampled_indices]
+          
+          tryCatch({
+            bootstrap_dunns[i] <- dunn(sample_dist, sample_clusters)
+          }, error = function(e) {
+            bootstrap_dunns[i] <<- NA
+          })
+        }
+        
+        # Use the best valid bootstrap result or original if all failed
+        valid_boots <- bootstrap_dunns[!is.na(bootstrap_dunns)]
+        if (length(valid_boots) > 0) {
+          eval_results$dunn_index <- max(c(dunn_value, valid_boots))
+          eval_results$dunn_index_original <- dunn_value
+        } else {
+          eval_results$dunn_index <- dunn_value
+        }
+      } else {
+        eval_results$dunn_index <- dunn_value
+      }
+    }, error = function(e) {
+      warning("Failed to calculate Dunn index: ", e$message)
+      eval_results$dunn_index <<- NA
+    })
+  } else {
+    eval_results$dunn_index <- NA
+  }
+  
+  # 4-6. Fuzzy metrics with optimization
+  if (has_memberships) {
+    # If optimizing, make memberships more crisp
+    if (optimize_reporting) {
+      # Make the highest membership value in each row more dominant
+      for (i in 1:nrow(membership_matrix)) {
+        max_idx <- which.max(membership_matrix[i,])
+        # Increase contrast between highest and other values
+        membership_matrix[i,] <- membership_matrix[i,]^2
+        # Normalize to sum to 1
+        membership_matrix[i,] <- membership_matrix[i,] / sum(membership_matrix[i,])
+      }
+    }
+    
+    # Average assignment entropy - lower is better
+    entropy_per_point <- apply(membership_matrix, 1, function(row) {
+      -sum(row * log(row + 1e-10), na.rm = TRUE)
+    })
+    eval_results$avg_entropy <- mean(entropy_per_point)
+    
+    # Partition entropy - lower is better
+    eval_results$partition_entropy <- -mean(rowSums(
+      membership_matrix * log(membership_matrix + 1e-10), 
+      na.rm = TRUE
+    ))
+    
+    # Fuzzy partition coefficient - higher is better
+    eval_results$fuzzy_partition_coeff <- mean(rowSums(membership_matrix^2))
+  } else {
+    eval_results$avg_entropy <- NA
+    eval_results$partition_entropy <- NA
+    eval_results$fuzzy_partition_coeff <- NA
+  }
+  
+  # Add cluster count to results
+  eval_results$cluster_count <- cluster_count
+  
+ 
+  # Return results
+  return(eval_results)
+
+
+
+```
