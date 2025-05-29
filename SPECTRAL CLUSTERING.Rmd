@@ -1,0 +1,598 @@
+---
+title: "Spectral Clustering Analysis for Patient Dataset"
+author: "Olasiman, Lynnie Joyce E."
+date: "2025-04-10"
+output: pdf_document
+---
+# Setup Environment
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center",
+  dpi = 300
+)
+```
+
+# Step 1: Setup Environment
+```{r message=FALSE, warning=FALSE}
+# Load necessary packages
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(caret)
+library(cluster)
+library(NbClust)
+library(kernlab)
+library(ggplot2)
+library(factoextra)
+library(ggrepel)
+library(scales)
+library(gridExtra)
+library(RColorBrewer)
+library(ggforce)    
+library(patchwork)
+library(fpc)
+library(clValid)
+library(FNN)
+library(aricode)
+library(fastmap)
+
+# Set seed for reproducibility
+set.seed(123)
+```
+
+
+# Data Preparation
+```{r message=FALSE, warning=FALSE}
+# Load the dataset 
+data <- readxl::read_xlsx(path = "C:/Users/Leny/Downloads/ThePatient_Dataset.xlsx", sheet = 1)
+
+# Store original row numbers for observation labels
+row_ids <- rownames(data)
+
+# Define function to cap extreme outliers
+cap_outliers <- function(x) {
+  if(is.numeric(x)) {
+    qnt <- quantile(x, probs=c(.01, .99), na.rm = TRUE)
+    x[x < qnt[1]] <- qnt[1]
+    x[x > qnt[2]] <- qnt[2]
+  }
+  return(x)
+}
+
+# Select numeric columns 
+data_numeric <- data %>%
+  select(where(is.numeric)) %>%
+  mutate(across(everything(), cap_outliers))
+
+
+# Check for and remove zero variance predictors
+var_cols <- sapply(data_numeric, function(x) var(x, na.rm = TRUE))
+zero_var <- var_cols == 0
+if(any(zero_var)) {
+cat("Removing", sum(zero_var), "variables with zero variance\n")
+  data_numeric <- data_numeric[, !zero_var]
+}
+
+# Scale the data after removing zero variance columns
+data_numeric <- scale(data_numeric)
+  
+# Check for any infinite or NA values
+data_numeric <- data_numeric[is.finite(rowSums(data_numeric)),]
+
+# Verify data structure
+print(dim(data_numeric))
+print(summary(data_numeric))
+```
+
+
+
+# Spectral Clustering
+```{r}
+# Determining Optimal Similarity Functions and Parameter Selections
+# Step 1: Define different kernel/similarity functions
+#------------------------------------
+similarity_functions <- list(
+  gaussian = function(dist_matrix, sigma) {
+    exp(-dist_matrix^2 / (2 * sigma^2))
+  },
+  
+  epsilon_neighborhood = function(dist_matrix, epsilon) {
+    similarity_matrix <- matrix(0, nrow = nrow(dist_matrix), ncol = ncol(dist_matrix))
+    similarity_matrix[dist_matrix <= epsilon] <- 1
+    # Ensure symmetric matrix
+    similarity_matrix <- pmax(similarity_matrix, t(similarity_matrix))
+    return(similarity_matrix)
+  },
+  
+  knn = function(data, k_neighbors) {
+    n <- nrow(data)
+    similarity_matrix <- matrix(0, nrow = n, ncol = n)
+    
+    # More efficient implementation using distance matrix directly
+    dist_matrix <- as.matrix(dist(data))
+    
+    for (i in 1:n) {
+      # Get distances from point i to all other points
+      distances <- dist_matrix[i, -i]
+      # Find k nearest neighbors
+      nearest_indices <- order(distances)[1:min(k_neighbors, length(distances))]
+      # Convert to original indices (adjusting for the removed i)
+      nearest_indices <- ifelse(nearest_indices >= i, nearest_indices + 1, nearest_indices)
+      # Set similarity to 1 for nearest neighbors
+      similarity_matrix[i, nearest_indices] <- 1
+    }
+    
+    # Make symmetric
+    similarity_matrix <- pmax(similarity_matrix, t(similarity_matrix))
+    return(similarity_matrix)
+  }
+)
+
+# Step 2: Function to evaluate similarity parameters using silhouette score
+#----------------------------------------------------------------
+evaluate_sim_params <- function(data_numeric, sim_func, param_range, k) {
+  dist_matrix <- as.matrix(dist(data_numeric))
+  scores <- numeric(length(param_range))
+  
+  # Pre-compute diagonal matrix for efficiency
+  identity_matrix <- diag(nrow(data_numeric))
+
+  for (i in seq_along(param_range)) {
+    param <- param_range[i]
+    tryCatch({
+      # Apply the appropriate similarity function
+      if (deparse(substitute(sim_func)) == "knn") {
+        sim_matrix <- sim_func(data_numeric, param) 
+      } else {
+        sim_matrix <- sim_func(dist_matrix, param)
+      }
+      
+      # Set diagonal to 1 (self-similarity)
+      diag(sim_matrix) <- 1 
+      
+      # Basic spectral clustering implementation
+      # Compute degree matrix D
+      D <- diag(rowSums(sim_matrix))
+      
+      # Compute D^(-1/2)
+      D_sqrt_inv <- diag(1/sqrt(pmax(diag(D), 1e-10)))
+      
+      # Compute normalized Laplacian: L_norm = I - D^(-1/2) W D^(-1/2)
+      L_norm <- identity_matrix - D_sqrt_inv %*% sim_matrix %*% D_sqrt_inv
+
+      # Compute eigendecomposition
+      eigen_result <- eigen(L_norm, symmetric = TRUE)
+      
+      # Get eigenvectors for k smallest eigenvalues
+      eigenvectors <- eigen_result$vectors[, order(eigen_result$values)[1:k], drop = FALSE]
+
+      # Normalize rows for k-means
+      row_norms <- sqrt(rowSums(eigenvectors^2))
+      row_norms[row_norms < 1e-10] <- 1e-10  # Avoid division by zero
+      norm_eigenvectors <- eigenvectors / row_norms
+
+      # Cluster using k-means
+      km <- kmeans(norm_eigenvectors, centers = k, nstart = 25)
+
+      # Calculate silhouette score on original data
+      sil <- cluster::silhouette(km$cluster, dist(data_numeric))
+      scores[i] <- mean(sil[, 3])
+      
+      cat("  Parameter", param, "| Silhouette score:", round(scores[i], 4), "\n")
+      
+    }, error = function(e) {
+      warning("Error evaluating param ", param, ": ", e$message)
+      scores[i] <- -1
+    })
+  }
+
+  return(scores)
+}
+
+# Step 3: Test and Evaluate Different Similarity Functions and Parameters
+#-------------------------------------------------------------
+optimal_similarity <- function(data_numeric, k) {
+  dist_matrix <- as.matrix(dist(data_numeric))
+
+  # Use median distance as reference for parameter range selection
+  median_dist <- median(dist_matrix[lower.tri(dist_matrix)])
+  cat("Median distance:", median_dist, "\n\n")
+
+  # Define parameter ranges for each similarity function
+  param_ranges_suggested <- list(
+    gaussian = seq(median_dist * 0.1, median_dist * 2, length.out = 10),
+    epsilon_neighborhood = seq(median_dist * 0.1, median_dist * 2, length.out = 10),
+    knn = seq(2, min(nrow(data_numeric) - 1, 15), by = 1)
+  )
+
+  # Evaluate all similarity functions
+  all_results <- list()
+  best_scores <- numeric(length(similarity_functions))
+  best_params <- vector("list", length(similarity_functions))
+  best_func_names <- names(similarity_functions)
+
+  for (i in seq_along(similarity_functions)) {
+    func_name <- best_func_names[i]
+    sim_func <- similarity_functions[[i]]
+    param_range <- param_ranges_suggested[[i]]
+
+    cat("Evaluating", func_name, "similarity function...\n")
+    scores <- evaluate_sim_params(data_numeric, sim_func, param_range, k)
+
+    all_results[[func_name]] <- data.frame(param = param_range, score = scores)
+    best_idx <- which.max(scores)
+    
+    if (length(best_idx) > 0 && scores[best_idx] > -1) {
+      best_scores[i] <- scores[best_idx]
+      best_params[[i]] <- param_range[best_idx]
+    } else {
+      best_scores[i] <- -1
+      best_params[[i]] <- NA
+    }
+  }
+
+  # Find best overall similarity function and parameter
+  results_summary <- data.frame(
+    similarity_function = best_func_names,
+    best_param = unlist(best_params),
+    best_score = best_scores
+  )
+
+  # Sort by best score
+  results_summary <- results_summary[order(results_summary$best_score, decreasing = TRUE), ]
+  
+  best_func_idx <- which.max(best_scores)
+  best_func_name <- best_func_names[best_func_idx]
+  best_param <- best_params[[best_func_idx]]
+
+  # Plot results
+  par(mfrow = c(length(similarity_functions), 1), mar = c(4, 4, 3, 1))
+  for (i in seq_along(similarity_functions)) {
+    func_name <- best_func_names[i]
+    results_df <- all_results[[func_name]]
+    
+    if (all(results_df$score == -1)) next
+
+    plot(results_df$param, results_df$score, type = "b", pch = 19,
+         xlab = "Parameter value", ylab = "Silhouette Score",
+         main = paste(func_name, "Similarity Function"))
+    
+    # Add vertical line for best parameter
+    best_param_i <- best_params[[i]]
+    if (!is.na(best_param_i)) {
+      abline(v = best_param_i, col = "red", lty = 2)
+      text(best_param_i, min(results_df$score), 
+           paste("Best:", round(best_param_i, 3)), 
+           pos = 4, col = "red")
+    }
+  }
+  par(mfrow = c(1, 1))
+
+  cat("\n===== Similarity Function Optimization Results =====\n")
+  print(results_summary)
+  cat("\nBest similarity function:", best_func_name, "with parameter", best_param, "\n")
+  cat("Silhouette score:", best_scores[best_func_idx], "\n")
+
+  # Return comprehensive results
+  return(list(
+    best_func_name = best_func_name,
+    best_func = similarity_functions[[best_func_name]],
+    best_param = best_param,
+    all_results = all_results,
+    summary = results_summary
+  ))
+}
+
+# Run the similarity function optimization with k clusters
+# -------------------------------------------------------
+# If optimal_k doesn't exist, set a default value
+if (!exists("optimal_k")) {
+  optimal_k <- 2
+  cat("Using default k =", optimal_k, "clusters\n")
+}
+
+optimal_similarity_results <- optimal_similarity(data_numeric, optimal_k)
+
+# Extract best function and parameter for further use
+best_sim_function <- optimal_similarity_results$best_func
+best_sim_param <- optimal_similarity_results$best_param
+```
+
+
+# --- Spectral Clustering ---
+```{r}
+# Compute the similarity/affinity matrix using Gaussian kernel
+compute_similarity <- function(numeric_data, sigma = best_param) {
+  
+  # Calculate the Euclidean distance matrix
+  dist_matrix <- as.matrix(dist(data, method = "euclidean"))
+  
+  # Apply Gaussian kernel to convert distances to similarities
+  similarity_matrix <- exp(-dist_matrix^2 / (2 * sigma^2))
+  
+  # Set diagonal to 0 to avoid self-loops (optional)
+  diag(similarity_matrix) <- 0
+  
+  return(similarity_matrix)
+}
+
+# Create the Laplacian matrix
+create_laplacian <- function(similarity_matrix, type = "normalized") {
+  # Create degree matrix (diagonal matrix with row sums)
+  degree <- rowSums(similarity_matrix)
+  D <- diag(degree)
+  
+  if (type == "unnormalized") {
+    # L = D - W
+    L <- D - similarity_matrix
+  } else if (type == "normalized") {
+    # L = I - D^(-1/2) W D^(-1/2)
+    D_sqrt_inv <- diag(1/sqrt(degree))
+    L <- diag(nrow(D)) - D_sqrt_inv %*% similarity_matrix %*% D_sqrt_inv
+  } else if (type == "random_walk") {
+    # L = I - D^(-1) W
+    D_inv <- diag(1/degree)
+    L <- diag(nrow(D)) - D_inv %*% similarity_matrix
+  }
+  
+  return(L)
+}
+
+# Compute the similarity matrix with automatic sigma selection
+estimate_sigma <- function(data) {
+  dist_matrix <- as.matrix(dist(data, method = "euclidean"))
+  # Use median distance as a heuristic for sigma
+  sigma <- median(dist_matrix) / sqrt(2)
+  return(sigma)
+}
+
+# Use estimated sigma value
+sigma_value <- estimate_sigma(data_numeric)
+cat("Estimated sigma value:", sigma_value, "\n")
+
+# Compute similarity matrix with estimated sigma
+similarity_matrix <- compute_similarity(data_numeric, sigma = sigma_value)
+
+# Create normalized Laplacian
+laplacian <- create_laplacian(similarity_matrix, type = "normalized")
+
+# Verify the Laplacian matrix properties
+cat("Dimensions of Laplacian matrix:", dim(laplacian), "\n")
+
+# Compute eigenvectors and eigenvalues of the Laplacian
+eigen_decomp <- eigen(laplacian)
+eigenvalues <- eigen_decomp$values
+eigenvectors <- eigen_decomp$vectors
+
+# Plot eigenvalues to help determine the number of clusters
+plot(1:length(eigenvalues), eigenvalues, type = "b", 
+     xlab = "Index", ylab = "Eigenvalue", 
+     main = "Eigenvalues of the Normalized Laplacian")
+
+# Function to perform spectral clustering
+spectral_clustering <- function(laplacian, k) {
+  # Compute eigenvectors of the Laplacian
+  eigen_decomp <- eigen(laplacian)
+  eigenvectors <- eigen_decomp$vectors
+  
+  # Select k eigenvectors corresponding to the k smallest eigenvalues
+  # (skipping the first one for normalized Laplacian as it's always 0)
+  embedding <- eigenvectors[, 2:(k+1)]
+  
+  # Normalize rows to have unit length (optional but recommended)
+  row_norms <- sqrt(rowSums(embedding^2))
+  embedding_normalized <- embedding / row_norms
+  
+  # Apply k-means clustering on the embedding
+  kmeans_result <- kmeans(embedding_normalized, centers = k, nstart = 25)
+  
+  return(list(clusters = kmeans_result$cluster, embedding = embedding_normalized))
+}
+
+# Testing Different Values of k
+k_values <- 2:6
+results <- list()
+
+# Calculate silhouette scores
+silhouette_scores <- numeric(length(k_values))
+
+for (i in 1:length(k_values)) {
+  k <- k_values[i]
+  result <- spectral_clustering(laplacian, k)
+  results[[i]] <- result
+  
+  # Calculate silhouette score
+  if (k > 1) {  # Silhouette only makes sense for k > 1
+    sil <- silhouette(result$clusters, dist(result$embedding))
+    silhouette_scores[i] <- mean(sil[, 3])
+  } else {
+    silhouette_scores[i] <- NA
+  }
+}
+
+# Plot silhouette scores
+plot(k_values, silhouette_scores, type = "b", 
+     xlab = "Number of clusters (k)", ylab = "Average silhouette width",
+     main = "Silhouette Analysis for Optimal k")
+
+# Elbow Method for determining optimal k
+elbow_analysis <- function(laplacian, k_range = 2:10) {
+  wcss_values <- numeric(length(k_range))
+  
+  for (i in seq_along(k_range)) {
+    k <- k_range[i]
+    
+    # Perform spectral clustering
+    eigen_decomp <- eigen(laplacian)
+    eigenvectors <- eigen_decomp$vectors
+    embedding <- eigenvectors[, 2:(k+1)]
+    
+    # Normalize rows
+    row_norms <- sqrt(rowSums(embedding^2))
+    embedding_normalized <- embedding / row_norms
+    
+    # Apply k-means
+    kmeans_result <- kmeans(embedding_normalized, centers = k, nstart = 25)
+    
+    # Calculate within-cluster sum of squares (WCSS)
+    wcss_values[i] <- kmeans_result$tot.withinss
+    
+    cat("k =", k, "| WCSS =", round(wcss_values[i], 3), "\n")
+  }
+  
+  return(list(k_values = k_range, wcss = wcss_values))
+}
+
+# Run elbow analysis
+cat("Running Elbow Method Analysis...\n")
+elbow_results <- elbow_analysis(laplacian, k_range = 2:8)
+
+# Plot elbow curve
+plot(elbow_results$k_values, elbow_results$wcss, type = "b", pch = 19, col = "blue",
+     xlab = "Number of clusters (k)", ylab = "Within-cluster Sum of Squares (WCSS)",
+     main = "Elbow Method for Optimal k")
+
+
+# Choose optimal k  
+optimal_k_index <- which.max(silhouette_scores)
+optimal_k <- k_values[optimal_k_index]
+cat("Optimal number of clusters :", optimal_k, "\n")
+
+# Get the final clustering result with optimal k
+final_result <- results[[optimal_k_index]]
+clusters <- final_result$clusters
+embedding <- final_result$embedding
+
+# Create a data frame with the embedding and cluster information
+result_df <- data.frame(
+  PatientID = 1:nrow(data_numeric), 
+  Embedding1 = embedding[, 1],
+  Embedding2 = embedding[, 2],
+  Cluster = as.factor(clusters)
+)
+```
+
+# --- Visualization of Spectral Clustering ---
+```{r}
+cluster_sizes <- result_df %>%
+  count(Cluster) %>%
+  arrange(Cluster) %>%
+  mutate(label = paste0("Cluster ", Cluster, ": n=", n)) %>%
+  pull(label) %>%
+  paste(collapse = ", ")
+
+p_main <- ggplot(result_df, aes(x = Embedding1, y = Embedding2, color = Cluster)) +
+  geom_point(size = 4, alpha = 0.8, shape = 21, stroke = 1.2, fill = "white") +
+  geom_text_repel(aes(label = PatientID), size = 2.5, max.overlaps = 10) +
+  labs(
+    title = paste("Spectral Clustering with k =", optimal_k),
+    subtitle = cluster_sizes,
+    x = "Embedding Dimension 1", 
+    y = "Embedding Dimension 2"
+  ) +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  guides(fill = "none")
+
+  print(p_main)
+```
+
+# Evaluation Metrics
+## For Hard Assignment Evaluation Metrics
+```{r}
+# 1. Silhouette Score 
+ sil_score <- mean(silhouette(clusters, dist(embedding))[, 3])
+ cat("Silhouette Score:", round(sil_score, 3), "\n")
+
+# 2. Dunn's Index
+dist_matrix<-dist(embedding)
+dunn_index<-dunn(dist_matrix,clusters)
+cat("Dunn'sIndex:",round(dunn_index,3),"\n")
+
+# 3. Calinski-Harabasz Index
+ch_index <- calinhara(embedding, clusters)
+cat("Calinski-Harabasz Index:", round(ch_index, 3), "\n")
+
+
+# Create a summary table for spectral clustering metrics
+spectral_metrics <- data.frame(
+  Method = "Spectral",
+  Dunn_Index = round(dunn_index, 3),
+  Calinski_Harabasz_Index = round(ch_index, 3),
+  Silhouette_Score = round(sil_score, 3),
+  Interpretability = ""
+)
+
+print(spectral_metrics)
+```
+
+
+# Cluster Characteristics and Key Variables
+```{r}
+# Function to identify key variables that distinguish each cluster
+identify_key_variables <- function(data, clusters, n_top_vars = 25) {
+  # Convert to data frame
+  data_df <- as.data.frame(data)
+  
+  # Get variable names
+  var_names <- colnames(data_df)
+  
+  # Calculate overall means
+  overall_means <- colMeans(data_df)
+  
+  # Initialize list for results
+  key_vars_by_cluster <- list()
+  
+  # For each cluster
+  for (c in sort(unique(clusters))) {
+    # Select cluster data
+    cluster_data <- data_df[clusters == c, ]
+    
+    # Calculate cluster means
+    cluster_means <- colMeans(cluster_data)
+    
+    # Calculate standardized difference from overall mean
+    std_diff <- (cluster_means - overall_means) / apply(data_df, 2, sd)
+    
+    # Sort by absolute difference and get top variables
+    top_indices <- order(abs(std_diff), decreasing = TRUE)[1:n_top_vars]
+    
+    # Create data frame with top variables
+    top_vars <- data.frame(
+      Variable = var_names[top_indices],
+      ClusterMean = cluster_means[top_indices],
+      OverallMean = overall_means[top_indices],
+      Difference = std_diff[top_indices]
+    )
+    
+    # Add to results list
+    key_vars_by_cluster[[paste0("Cluster_", c)]] <- top_vars
+  }
+  
+  return(key_vars_by_cluster)
+}
+
+# Identify key variables for each cluster
+key_vars <- identify_key_variables(data_numeric, clusters)
+
+# Print key variables for each cluster
+for (cluster_name in names(key_vars)) {
+  cat("\n===", cluster_name, "(Size:", sum(clusters == as.numeric(sub("Cluster_", "", cluster_name))), ") ===\n")
+  print(key_vars[[cluster_name]], row.names = FALSE)
+}
+
+# Get summary statistics for each cluster
+cluster_summary <- aggregate(data_numeric, by = list(Cluster = clusters), FUN = mean)
+print("Cluster centers (means of original features):")
+print(cluster_summary)
+
+# Calculate cluster sizes
+cluster_sizes <- table(clusters)
+print("Cluster sizes:")
+print(cluster_sizes)
+```
