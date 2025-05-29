@@ -1,0 +1,292 @@
+---
+title: "Untitled"
+author: "Angel Dunamis T. Cagula"
+date: "2025-04-22"
+output: pdf_document
+---
+```{r }
+
+# Load and preprocess data
+library(tidyverse)
+library(readxl)
+library(cluster)
+library(factoextra)
+library(NbClust)
+library(ppclust)
+library(e1071)
+library(fpc)
+library(plotly)
+library(rstatix)
+library(FSA)
+library(ggplot2)
+library(fclust)
+
+
+set.seed(123)
+data <- ThePatient_Dataset 
+
+df <- data %>%
+  select(-Date_Admitted, -Adress_Code) %>%
+  group_by(Patient_ID) %>%
+  mutate(spec_idx = row_number()) %>%
+  unite("Patient_ID", Patient_ID, spec_idx, sep = "-") %>%
+  ungroup() %>%
+  column_to_rownames("Patient_ID") %>%
+  select(where(~ var(.) != 0)) %>%
+  scale()
+  matrix()
+
+
+# --- Exploratory Analysis ---
+print(dim(df))
+print(summary(df))
+```
+
+```{r message=FALSE, warning=FALSE}
+
+data_numeric<-df
+
+find_optimal_clusters_elbow <- function(data_matrix, max_k = NULL) {
+  if (is.null(max_k)) {
+    max_k <- min(10, ceiling(sqrt(nrow(data_matrix)/2)))
+  }
+  
+  # Calculate WSS for different k values
+  wss <- sapply(1:max_k, function(k) {
+    kmeans(data_matrix, centers = k, nstart = 25)$tot.withinss
+  })
+  
+  # Plot results
+  wss_plot <- fviz_nbclust(data_matrix, kmeans, method = "wss") +
+    theme(aspect.ratio = 0.7) +
+    labs(title = "Elbow Method for Optimal k",
+         subtitle = "Within Sum of Squares Method") +
+    theme_bw(base_size = 12)
+  
+  # Determine optimal k using the elbow method
+  # Calculate the differences in WSS
+  wss_diff <- c(NA, diff(wss))
+  wss_diff_rate <- c(NA, diff(wss) / wss[-1])
+  
+
+  threshold <- 0.2  
+  candidate_k <- which(abs(wss_diff_rate) < threshold)[1]
+  
+  # If no clear elbow is found using the threshold, use a different approach
+  if (is.na(candidate_k)) {
+    # Calculate second differences (acceleration)
+    wss_second_diff <- c(NA, NA, diff(diff(wss)))
+    # Find the k where the acceleration is maximum
+    candidate_k <- which.max(abs(wss_second_diff)) - 1
+  }
+  
+  optimal_k <- min(candidate_k, max_k)
+  
+  # Create a data frame for plotting the results
+  wss_df <- data.frame(
+    k = 1:max_k,
+    wss = wss,
+    diff = c(NA, diff(wss)),
+    diff_rate = c(NA, diff(wss) / wss[-1])
+  )
+  
+  # Create a plot showing the elbow point
+  elbow_plot <- ggplot(wss_df, aes(x = k, y = wss)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 3) +
+    geom_vline(xintercept = optimal_k, linetype = "dashed", color = "red", size = 1) +
+    annotate("text", x = optimal_k + 0.3, y = max(wss) * 0.9, 
+             label = paste("Optimal k =", optimal_k), 
+             color = "red", size = 5, hjust = 0) +
+    theme_bw(base_size = 12) +
+    labs(title = "Determining the Optimal Number of Clusters",
+         subtitle = "Elbow Method with Optimal k",
+         x = "Number of Clusters (k)",
+         y = "Within-Cluster Sum of Squares") +
+    theme(plot.title = element_text(face = "bold"),
+          aspect.ratio = 0.7)
+  
+  print(elbow_plot)
+  
+  return(list(
+    optimal_k = optimal_k,
+    wss_plot = wss_plot,
+    elbow_plot = elbow_plot,
+    wss = wss,
+    wss_df = wss_df
+  ))
+}
+
+# Find the optimal number of clusters using only the elbow method
+cluster_info <- find_optimal_clusters_elbow(data_numeric)
+cat("Optimal number of clusters:", cluster_info$optimal_k, "\n")
+
+# Find optimal clusters using the Gap Statistic method
+find_optimal_clusters_gap <- function(data_matrix, max_k = NULL) {
+  if (is.null(max_k)) {
+    max_k <- min(10, ceiling(sqrt(nrow(data_matrix)/3)))
+  }
+  
+
+  gap_stat <- clusGap(data_matrix, FUN = function(x, k) kmeans(x, centers = k, nstart = 50), 
+                      K.max = max_k, B = 100)
+  
+  # Extract gap statistic results
+  gap_df <- as.data.frame(gap_stat$Tab)
+  
+  gap_values <- gap_df$gap
+  gap_diffs <- c(NA, diff(gap_values))
+  
+
+  weighted_scores <- numeric(length(gap_values))
+  for(i in 2:length(gap_values)) {
+    weighted_scores[i] <- gap_values[i] + (gap_diffs[i] > 0) * 0.01
+  }
+  
+  
+  optimal_k 
+  
+  # Gap statistic plot
+  gap_plot <- ggplot(gap_df, aes(x = 1:nrow(gap_df), y = gap)) +
+    geom_line(size = 1.2) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = gap - SE.sim, ymax = gap + SE.sim), width = 0.2) +
+    geom_vline(xintercept = optimal_k, linetype = "dashed", color = "red", size = 1) +
+    annotate("text", x = optimal_k + 0.3, y = max(gap_df$gap) * 0.9, 
+             label = paste("Optimal k =", optimal_k), 
+             color = "red", size = 5, hjust = 0) +
+    theme_bw(base_size = 12) +
+    labs(title = "Determining the Optimal Number of Clusters",
+         subtitle = "Gap Statistic Method with Optimal k",
+         x = "Number of Clusters (k)",
+         y = "Gap Statistic") +
+    theme(plot.title = element_text(face = "bold"),
+          aspect.ratio = 0.7)
+  
+  print(gap_plot)
+  
+  return(list(
+    optimal_k = optimal_k,
+    gap_stat = gap_stat,
+    gap_plot = gap_plot,
+    gap_df = gap_df
+  ))
+}
+
+# Find the optimal number of clusters using the gap statistic method
+gap_cluster_info <- find_optimal_clusters_gap(data_numeric)
+cat("Optimal number of clusters (Gap Statistic):", gap_cluster_info$optimal_k, "\n")
+
+cat("Gap Statistic:", gap_cluster_info$optimal_k, "\n")
+```
+
+```{r}
+# --- Fuzzy C-Means Silhouette Function ---
+fcm_silhouette <- function(data, k, m = 3) {
+  model <- cmeans(df, centers = k, m = m, iter.max = 300)
+  clusters <- apply(model$membership, 1, which.max)
+  sil <- silhouette(clusters, dist(df))
+  mean(sil[, 3])
+}
+# --- Fuzzy C-Means Elbow Function ---
+fcm_wss <- function(data, centers, m = 2) {
+  model <- tryCatch({
+    cmeans(df, centers = centers, m = m)
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  if (!is.null(model)) {
+    return(sum(model$withinerror))
+  } else {
+    return(NA)  # return NA instead of NULL if it fails
+  }
+}
+
+k.values <- 2:10
+fcm_wss_values <- sapply(k.values, function(k) fcm_wss(df, k))
+
+# Optional: Remove NAs if any models failed
+valid_k <- !is.na(fcm_wss_values)
+plot(k.values[valid_k], fcm_wss_values[valid_k], type = "b", pch = 19,
+     xlab = "Number of Clusters", ylab = "WSS (FCM)",
+     main = "Elbow Method for Fuzzy C-Means")
+```
+```{r}
+# --- Run FCM Multiple Times for Stability ---
+run_multiple_fcm <- function(data, k, runs = 10) {
+  mean(sapply(1:runs, function(i) {
+    set.seed(i * 100)
+    fcm_silhouette(data, k)
+  }))
+}
+
+k.values <- 2:10
+silhouette.scores <- sapply(k.values, function(k) run_multiple_fcm(df, k))
+plot(k.values, silhouette.scores, type = "b", pch = 19, xlab = "Clusters", ylab = "Avg Silhouette")
+best.k <- k.values[which.max(silhouette.scores)]
+cat("Optimal clusters (FCM):", best.k, "\n")
+
+# --- FCM with Best k ---
+fcm_model <- cmeans(df, centers = best.k, m = 2.5, iter.max = 100)
+fcm_labels <- apply(fcm_model$membership, 1, which.max)
+table(fcm_labels)
+
+fviz_cluster(list(data = df, cluster = fcm_labels), geom = "point",
+             main = paste("Fuzzy C-Means with", best.k, "Clusters"))
+
+# --- Cluster Validation ---
+cat("K-Means Dunn Index:", cluster.stats(dist(df), km$cluster)$dunn, "\n")
+cat("K-Means CH Index:", cluster.stats(dist(df), km$cluster)$ch, "\n")
+cat("FCM Dunn Index:", cluster.stats(dist(df), fcm_model$cluster)$dunn, "\n")
+cat("FCM CH Index:", cluster.stats(dist(df), fcm_model$cluster)$ch, "\n")
+
+# --- 3D PCA Visualization ---
+pca_3d <- as.data.frame(prcomp(df)$x[, 1:3]) %>%
+  mutate(cluster = as.factor(km$cluster), obs = row_number())
+
+plot_ly(pca_3d, x = ~PC1, y = ~PC2, z = ~PC3, color = ~cluster,
+        type = "scatter3d", mode = "markers+text", text = ~obs,
+        marker = list(size = 6, opacity = 0.7))
+
+```
+
+
+
+```{r}
+
+membership_mat <- fcm_model$membership
+
+# Optional: Add rownames for interpretability
+rownames(membership_mat) <- paste0("Sample_", 1:nrow(membership_mat))
+colnames(membership_mat) <- paste0("Cluster_", 1:ncol(membership_mat))
+
+par(mar = c(7, 5, 4, 2) + 0.1)
+
+# Plot heatmap
+heatmap(membership_mat, Rowv = NA, Colv = NA,
+        col = colorRampPalette(c("white", "blue"))(100),
+        cexCol = 0.8,            
+        cexRow = 0.8, 
+        scale = "none", margins = c(5,5),
+        main = "FCM Membership Heatmap")
+
+
+dist_mat <- dist(df)
+sil_score <- silhouette(fcm_labels, dist_mat)
+cat("Silhouette Score:", round(mean(sil_score[, 3]), 3), "\n")
+
+ch_index <- calinhara(as.matrix(df), fcm_labels)
+cat("Calinski-Harabasz Index:", round(ch_index, 1), "\n")
+
+cat("Dunn Index:", cluster.stats(dist(df), fcm_model$cluster)$dunn, "\n")
+
+entropy_vals <- apply(membership_mat, 1, function(row) -sum(row * log(row + 1e-10)))
+cat("Avg Assignment Entropy:", round(mean(entropy_vals), 3), "\n")
+
+partition_entropy <- -mean(rowSums(membership_mat * log(membership_mat + 1e-10)))
+cat("Partition Entropy:", round(partition_entropy, 3), "\n")
+
+fuzzy_partition_coeff <- mean(rowSums(membership_mat^2))
+cat("Fuzzy Partition Coefficient:", round(fuzzy_partition_coeff, 3), "\n")
+```
