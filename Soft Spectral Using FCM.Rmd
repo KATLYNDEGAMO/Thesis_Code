@@ -1,5 +1,5 @@
 ---
-title: "Spectral Clustering Analysis for Patient Dataset"
+title: "Soft Spectral Using FCM Clustering Method for Patient Dataset"
 author: "Olasiman, Lynnie Joyce E."
 date: "2025-04-10"
 output: pdf_document
@@ -313,8 +313,9 @@ best_sim_param <- optimal_similarity_results$best_param
 
 # --- Spectral Clustering Using Fuzzy C-Means ---
 ```{r}
-# Compute the similarity matrix 
-compute_similarity <- function(data_numeric, sigma = best_param) {
+# Compute the similarity/affinity matrix using Gaussian kernel
+compute_similarity <- function(numeric_data, sigma = best_param) {
+  
   # Calculate the Euclidean distance matrix
   dist_matrix <- as.matrix(dist(data, method = "euclidean"))
   
@@ -327,22 +328,21 @@ compute_similarity <- function(data_numeric, sigma = best_param) {
   return(similarity_matrix)
 }
 
-
 # Create the Laplacian matrix
 create_laplacian <- function(similarity_matrix, type = "normalized") {
-  # Create degree matrix 
+  # Create degree matrix (diagonal matrix with row sums)
   degree <- rowSums(similarity_matrix)
   D <- diag(degree)
   
   if (type == "unnormalized") {
-
+    # L = D - W
     L <- D - similarity_matrix
   } else if (type == "normalized") {
-
+    # L = I - D^(-1/2) W D^(-1/2)
     D_sqrt_inv <- diag(1/sqrt(degree))
     L <- diag(nrow(D)) - D_sqrt_inv %*% similarity_matrix %*% D_sqrt_inv
   } else if (type == "random_walk") {
-
+    # L = I - D^(-1) W
     D_inv <- diag(1/degree)
     L <- diag(nrow(D)) - D_inv %*% similarity_matrix
   }
@@ -350,28 +350,36 @@ create_laplacian <- function(similarity_matrix, type = "normalized") {
   return(L)
 }
 
-# Compute similarity matrix using the best parameters found earlier
-if (optimal_similarity_results$best_func_name == "gaussian") {
-  similarity_matrix <- optimal_similarity_results$best_func(as.matrix(dist(data_numeric)), optimal_similarity_results$best_param)
-} else if (optimal_similarity_results$best_func_name == "knn") {
-  similarity_matrix <- optimal_similarity_results$best_func(data_numeric, optimal_similarity_results$best_param)
-} else if (optimal_similarity_results$best_func_name == "epsilon_neighborhood") {
-  similarity_matrix <- optimal_similarity_results$best_func(as.matrix(dist(data_numeric)), optimal_similarity_results$best_param)
+# Compute the similarity matrix with automatic sigma selection
+estimate_sigma <- function(data) {
+  dist_matrix <- as.matrix(dist(data, method = "euclidean"))
+  # Use median distance as a heuristic for sigma
+  sigma <- median(dist_matrix) / sqrt(2)
+  return(sigma)
 }
 
-# Create the Laplacian matrix
+# Use estimated sigma value
+sigma_value <- estimate_sigma(data_numeric)
+cat("Estimated sigma value:", sigma_value, "\n")
+
+# Compute similarity matrix with estimated sigma
+similarity_matrix <- compute_similarity(data_numeric, sigma = sigma_value)
+
+# Create normalized Laplacian
 laplacian <- create_laplacian(similarity_matrix, type = "normalized")
 
+# Verify the Laplacian matrix properties
+cat("Dimensions of Laplacian matrix:", dim(laplacian), "\n")
 
-  # Compute eigenvectors and eigenvalues of the Laplacian
-  eigen_decomp <- eigen(laplacian)
-  eigenvalues <- eigen_decomp$values
-  eigenvectors <- eigen_decomp$vectors
+# Compute eigenvectors and eigenvalues of the Laplacian
+eigen_decomp <- eigen(laplacian)
+eigenvalues <- eigen_decomp$values
+eigenvectors <- eigen_decomp$vectors
 
-  # Plot eigenvalues to help determine the number of clusters
-  plot(1:length(eigenvalues), eigenvalues, type = "b", 
-      xlab = "Index", ylab = "Eigenvalue", 
-      main = "Eigenvalues of the Normalized Laplacian")
+# Plot eigenvalues to help determine the number of clusters
+plot(1:length(eigenvalues), eigenvalues, type = "b", 
+     xlab = "Index", ylab = "Eigenvalue", 
+     main = "Eigenvalues of the Normalized Laplacian")
 
 # Function to perform spectral clustering with fuzzy c-means
 spectral_fcm_clustering <- function(laplacian, k, m = 2) {
